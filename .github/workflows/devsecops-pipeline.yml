@@ -1,0 +1,125 @@
+name: 🛡️ DevSecOps Pipeline - Juice Shop
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  # ======================
+  # 1. Checkout & Setup
+  # ======================
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🧾 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 📦 Install Dependencies
+        run: |
+          cd src
+          npm install
+
+  # ======================
+  # 2. SAST - Semgrep
+  # ======================
+  sast:
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: 🧾 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🔍 Run Semgrep (SAST)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: "p/owasp-top-ten"
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+  # ======================
+  # 3. Dependency Scans (npm + Trivy)
+  # ======================
+  dependency-scan:
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: 🧾 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 📦 npm audit
+        run: |
+          cd src
+          npm audit --audit-level=high || true
+
+      - name: 🔍 Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      - name: 🔐 Trivy File System Scan
+        run: |
+          trivy fs --exit-code 0 --severity HIGH,CRITICAL .
+
+  # ======================
+  # 4. DAST - OWASP ZAP
+  # ======================
+  dast:
+    runs-on: ubuntu-latest
+    needs: dependency-scan
+    steps:
+      - name: 🌐 Run Juice Shop in background
+        run: |
+          docker run -d -p 3000:3000 --name juice-shop bkimminich/juice-shop
+          sleep 15
+
+      - name: 🧪 Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.9.0
+        with:
+          target: "http://localhost:3000"
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-a"
+
+  # ======================
+  # 5. Deploy to VPS
+  # ======================
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-scan, dast]
+    steps:
+      - name: 🚀 Deploy to VPS (Juice Shop)
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: 82.25.79.61
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            echo "📦 Pulling latest Juice Shop image..."
+            docker pull bkimminich/juice-shop
+
+            echo "🛑 Stopping existing container (if running)..."
+            docker stop juice-shop || true
+            docker rm juice-shop || true
+
+            echo "📂 Creating persistent volume..."
+            docker volume create juice_data || true
+
+            echo "🚀 Starting new container..."
+            docker run -d \
+              --name juice-shop \
+              -p 3000:3000 \
+              -v juice_data:/juice-shop/data \
+              bkimminich/juice-shop
+
+            echo "✅ Deploy complete!"
